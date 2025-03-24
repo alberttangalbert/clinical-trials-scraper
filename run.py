@@ -5,7 +5,7 @@ import sys
 
 API_URL = "https://clinicaltrials.gov/api/v2/studies"
 OUTPUT_FILE = "recent_clinical_trials.json"
-PAGE_SIZE = 100  # number of trials to fetch
+PAGE_SIZE = 1000  # number of trials to fetch
 
 FAILED_STATUSES = {"TERMINATED", "SUSPENDED", "WITHDRAWN"}
 
@@ -74,3 +74,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    
