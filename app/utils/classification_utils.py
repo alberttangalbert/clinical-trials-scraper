@@ -1,60 +1,62 @@
 import ast
+import re
 from typing import List
 
-def parse_chatbot_response(response: str) -> List[str]:
+def clean_text(text: str) -> str:
     """
-    Parses the chatbot's response into a list of modality or indication areas.
-    The response should be a Python list in string form, e.g. ["Protein/Monoclonal Antibodies", "Small molecules and Natural Products"].
-    Returns an empty list if parsing fails or the format is invalid.
+    Cleans text by converting to lowercase and replacing non-letter characters with spaces.
+    
+    Args:
+        text (str): Text to clean.
+        
+    Returns:
+        str: Cleaned text.
+    """
+    # Convert to lowercase
+    text = text.lower()
+    # Replace non-letter characters with spaces
+    text = re.sub(r'[^a-z]', ' ', text)
+    # Replace multiple spaces with single space
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def parse_chatbot_response(response: str, possible_classifications: List[str]) -> List[str]:
+    """
+    Parses the chatbot's response to find all occurrences of the known indication or modality areas.
+    It loops over each possible classification and checks if it is mentioned in the response.
+    The matching is case-insensitive and handles various text formats.
+    
+    If found, it adds the classification to the returned list. This avoids needing to evaluate
+    the response as a literal Python list.
 
     Args:
         response (str): Chatbot response as a string.
+        possible_classifications (List[str]): List of valid possible indication or modality areas.
 
     Returns:
-        List[str]: Parsed list of modality or indication areas.
-        
+        List[str]: List of indication areas found in the chatbot response.
+    
     Examples:
-        >>> parse_chatbot_response("['Protein/Monoclonal Antibodies', 'Small molecules and Natural Products']")
-        ['Protein/Monoclonal Antibodies', 'Small molecules and Natural Products']
-
-        >>> parse_chatbot_response("['Peptides/Cyclic', 'Vaccines']")
-        ['Peptides/Cyclic', 'Vaccines']
-
-        >>> parse_chatbot_response("[]")
-        []
-
-        >>> parse_chatbot_response("Invalid input")
+        >>> response = "The description is about risedronate, a drug primarily used to treat metabolic bone diseases. These conditions fall under the category of: Cardiovascular/Metabolic"
+        >>> possible_classifications = [
+        ...   "Oncology", "Neurology/Psychiatry", "Cardiovascular/Metabolic", "Immunology/Autoimmune",
+        ...   "Infectious Diseases", "Hematology", "Gastrointestinal/Hepatology", "Dermatology",
+        ...   "Ophthalmology", "Respiratory", "Urology/Renal", "Pain Management/Anesthetics"
+        ... ]
+        >>> parse_chatbot_response(response, possible_classifications)
+        ['Cardiovascular/Metabolic']
     """
-    try:
-        data = ast.literal_eval(response)
-        if isinstance(data, list) and all(isinstance(item, str) for item in data):
-            return data
-    except (SyntaxError, ValueError):
-        return None  
-    return None
-
-
-def validate_classifications(classifications: List[str], possible_classifications: List[str]) -> bool:
-    """
-    Validates that each classification in the returned classifications is in the provided possible_classifications list.
-
-    :param classifications: The list of classifications returned by a model or function.
-    :param possible_classifications: The list of valid possible classifications.
-    :return: True if all classifications are valid, False otherwise.
-
-    Examples:
-        >>> validate_classifications(['Pain Management/Anesthetics', 'Dermatology'], 
-        ...                           ['Oncology', 'Neurology/Psychiatry', 'Cardiovascular/Metabolic', 'Immunology/Autoimmune', 
-        ...                            'Pain Management/Anesthetics', 'Dermatology'])
-        True
-
-        >>> validate_classifications(['Protein/Monoclonal Antibodies', 'Small molecules and Natural Products'], 
-        ...                           ['Protein/Monoclonal Antibodies', 'Small molecules and Natural Products', 'Peptides/Cyclic'])
-        True
+    # Clean the response text
+    cleaned_response = clean_text(response)
+    
+    found = []
+    for classification in possible_classifications:
+        # Clean the classification text
+        cleaned_classification = clean_text(classification)
         
-        >>> validate_classifications(['Protein/Others', 'Peptides/Pegylated'], 
-        ...                           ['Protein/Monoclonal Antibodies', 'Small molecules and Natural Products', 'Peptides/Amino Acids with More than 40 Residues'])
-        False
-        
-    """
-    return all(classification in possible_classifications for classification in classifications)
+        # Check if the cleaned classification is in the cleaned response
+        if cleaned_classification in cleaned_response:
+            # Add the original classification (not the cleaned version) to the results
+            found.append(classification)
+    
+    return found
