@@ -1,66 +1,30 @@
 from dotenv import load_dotenv
-
 load_dotenv()
 
 import json
 import pandas as pd
 import datetime
+import re
 from typing import Dict, Any, List
-from app.core.modality_classifier import get_modality_areas_from_description
-from app.core.indication_classifier import get_indication_areas_from_description
-from app.core.outcome_classifier import get_outcome_areas_from_description
-from app.core.primary_purpose_classifier import get_primary_purpose_areas_from_description
-from app.core.disease_condition_classifier import get_disease_condition_from_description
+
+from app.services.bing_search import search_bing
+from app.services.scrape_webpage import scrape_and_parse_webpage, get_cached_drug_info
+
+# Define the elements we want to extract (using data-testid attributes)
+TARGET_ELEMENTS = [
+    "descriptions-item__value--drugType",
+    "descriptions-item__value--synonyms",
+    "descriptions-item__value--target",
+    "descriptions-item__value--action",
+    "descriptions-item__value--mechanism",
+    "descriptions-item__value--therapeutic",
+    "descriptions-item__value--activeDisease",
+    "descriptions-item__value--inActiveDisease",
+    "descriptions-item__value--originOrg",
+    "descriptions-item__value--activeOrg"
+]
 
 # ---- Helper functions for one-hot encoding and processing ----
-def encode_outcomes(text: str, company_name: str, azure_service, outcome_areas: List[str]) -> Dict[str, int]:
-    """
-    One-hot encode outcomes categories from text using the outcome classifier.
-    Categories: Clinical Outcomes, Surrogate Outcomes, Composite Outcomes, Patient-Reported Outcomes,
-                Pharmacokinetic/Pharmacodynamic Outcomes, Safety/Tolerability Outcomes.
-    """
-    print(f"\n[DEBUG] Encoding outcomes for company: {company_name}")
-    print(f"[DEBUG] Input text length: {len(text)} characters")
-    
-    categories = ["Clinical Outcomes", "Surrogate Outcomes", "Composite Outcomes",
-                 "Patient-Reported Outcomes", "Pharmacokinetic/Pharmacodynamic Outcomes",
-                 "Safety/Tolerability Outcomes"]
-    
-    # Get the outcome areas using the classifier
-    print("[DEBUG] Calling outcome classifier...")
-    outcome_areas_found = get_outcome_areas_from_description(
-        text, company_name, azure_service, outcome_areas
-    )
-    print(f"[DEBUG] Found outcome areas: {outcome_areas_found}")
-    
-    # Create one-hot encoding based on found outcome areas with case-insensitive comparison
-    result = {cat: 1 if cat.lower() in [area.lower() for area in outcome_areas_found] else 0 for cat in categories}
-    print(f"[DEBUG] One-hot encoding result: {result}")
-    return result
-
-def encode_primary_purpose(purpose: str, company_name: str, azure_service, primary_purpose_areas: List[str]) -> Dict[str, int]:
-    """
-    One-hot encode primary purpose using the primary purpose classifier.
-    Categories: Treatment, Prevention, Diagnostic, Supportive Care, Screening,
-               Health Services Research, Basic Science, Other
-    """
-    print(f"\n[DEBUG] Encoding primary purpose for company: {company_name}")
-    print(f"[DEBUG] Input purpose length: {len(purpose)} characters")
-    
-    categories = ["Treatment", "Prevention", "Diagnostic", "Supportive Care", 
-                 "Screening", "Health Services Research", "Basic Science", "Other"]
-    
-    # Get the primary purpose areas using the classifier
-    print("[DEBUG] Calling primary purpose classifier...")
-    purpose_areas_found = get_primary_purpose_areas_from_description(
-        purpose, company_name, azure_service, primary_purpose_areas
-    )
-    print(f"[DEBUG] Found primary purpose areas: {purpose_areas_found}")
-    
-    # Create one-hot encoding based on found purpose areas with case-insensitive comparison
-    result = {cat: 1 if cat.lower() in [area.lower() for area in purpose_areas_found] else 0 for cat in categories}
-    print(f"[DEBUG] One-hot encoding result: {result}")
-    return result
 
 def one_hot_phases(phases: str) -> Dict[str, int]:
     """
@@ -116,311 +80,115 @@ def count_collaborators(collaborators: str) -> int:
     """
     Count the number of collaborators by splitting the string on commas.
     Returns 0 if collaborators is None or empty.
-    
-    :param collaborators: String containing collaborators separated by commas
-    :return: Number of collaborators
     """
     if not collaborators:
         return 0
-    # Split on comma and filter out empty strings
     collaborator_list = [c.strip() for c in collaborators.split(",") if c.strip()]
     return len(collaborator_list)
 
-# ---- Main processing function for a company ----
-def process_company(company_name: str, trials: List[Dict[str, Any]],
-                    azure_service, modality_list: List[str], indication_list: List[str],
-                    outcome_areas: List[str], primary_purpose_areas: List[str]) -> pd.DataFrame:
-    print(f"\n[DEBUG] Processing company: {company_name}")
-    print(f"[DEBUG] Number of trials to process: {len(trials)}")
+def scrape_drug_info(drug_name: str) -> Dict[str, str]:
+    """
+    Scrape drug information from PatSnap using Bing search, with caching.
+    """
+    print(f"\n[DEBUG] Scraping drug info for: {drug_name}")
     
+    # Clean the drug name for caching
+    clean_name = re.sub(r"[^\w\-]", "", drug_name.split()[0].split(",")[0])
+    
+    # Check cache first
+    cached_info = get_cached_drug_info(clean_name)
+    if cached_info:
+        return cached_info
+    
+    # Search PatSnap via Bing
+    domain = "synapse.patsnap.com"
+    results = search_bing(drug_name, domain)
+    print(f"[DEBUG] Bing search results: {results}")
+    
+    # Look for the first Synapse drug page
+    for page in results.get('webPages', {}).get('value', []):
+        url = page.get('url', '')
+        if 'synapse.patsnap.com/drug' in url:
+            print(f"[DEBUG] Found drug page URL: {url}")
+            content = scrape_and_parse_webpage(url, TARGET_ELEMENTS, clean_name)
+            print(f"[DEBUG] Extracted content: {content}")
+            return content
+
+    print("[DEBUG] No drug page found")
+    return {}
+
+def process_company(company_name: str, trials: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Process all trials for a single company and return a DataFrame.
+    """
+    print(f"\n[DEBUG] Processing company: {company_name} ({len(trials)} trials)")
     rows = []
-    for i, trial in enumerate(trials, 1):
-        print(f"\n[DEBUG] Processing trial {i}/{len(trials)}")
+    
+    for i, trial in enumerate(trials, start=1):
+        drug_name = trial.get("Interventions", "")
+        trial_id  = trial.get("NCT ID", "")
+        print(f"[DEBUG] Trial {i}: {drug_name} ({trial_id})")
         
-        # Join Detailed Description and Brief Summary for classification
-        description = ""
-        if trial.get("Detailed Description"):
-            description += trial["Detailed Description"]
-        if trial.get("Brief Summary"):
-            description += " " + trial["Brief Summary"]
-        print(f"[DEBUG] Combined description length: {len(description)} characters")
-            
-        print("[DEBUG] Classifying modality...")
-        modalities = get_modality_areas_from_description(description, azure_service, modality_list, company_name)
-        print(f"[DEBUG] Found modalities: {modalities}")
-        
-        print("[DEBUG] Classifying indications...")
-        indications = get_indication_areas_from_description(description, azure_service, indication_list, company_name)
-        print(f"[DEBUG] Found indications: {indications}")
-        
-        print("[DEBUG] Classifying disease conditions...")
-        disease_category = ""
-        disease_condition = ""
-        disease_conditions_result = get_disease_condition_from_description(description, azure_service, company_name)
-        print(f"[DEBUG] Raw disease conditions result: {disease_conditions_result}")
-        
-        if disease_conditions_result:
-            if len(disease_conditions_result) >= 1:
-                disease_category = disease_conditions_result[0]
-                print(f"[DEBUG] Found disease category: {disease_category}")
-            if len(disease_conditions_result) >= 2:
-                disease_condition = disease_conditions_result[1]
-                print(f"[DEBUG] Found specific condition: {disease_condition}")
+        # Scrape or fetch from cache
+        if drug_name:
+            cleaned = re.sub(r"[^\w\-]", "", drug_name.split()[0].split(",")[0])
+            drug_info = scrape_drug_info(f"{cleaned} {trial_id}")
         else:
-            print("[DEBUG] No disease conditions found")
+            drug_info = {}
         
-        # Process outcomes one-hot using the new classifier
-        print("[DEBUG] Processing primary outcomes...")
-        primary_outcomes = get_outcome_areas_from_description(
-            trial.get("Primary Outcomes", ""), 
-            azure_service, 
-            outcome_areas,
-            company_name
-        )
-        primary_outcomes_encoding = {cat: 1 if cat in primary_outcomes else 0 for cat in outcome_areas}
-        print(f"[DEBUG] Found primary outcomes: {primary_outcomes}")
-        
-        print("[DEBUG] Processing secondary outcomes...")
-        secondary_outcomes = get_outcome_areas_from_description(
-            trial.get("Secondary Outcomes", ""), 
-            azure_service, 
-            outcome_areas,
-            company_name
-        )
-        secondary_outcomes_encoding = {cat: 1 if cat in secondary_outcomes else 0 for cat in outcome_areas}
-        print(f"[DEBUG] Found secondary outcomes: {secondary_outcomes}")
-        
-        # One-hot encode study type and phases
-        print("[DEBUG] Encoding study type...")
-        study_type_encoding = one_hot_study_type(trial.get("Study Type", ""))
-        
-        print("[DEBUG] Encoding phases...")
-        phase_encoding = one_hot_phases(trial.get("Phases", ""))
-        
-        # Encode primary purpose using the new classifier
-        print("[DEBUG] Processing primary purpose...")
-        primary_purpose = get_primary_purpose_areas_from_description(
-            trial.get("Primary Purpose", ""), 
-            azure_service, 
-            primary_purpose_areas,
-            company_name
-        )
-        primary_purpose_encoding = {cat: 1 if cat in primary_purpose else 0 for cat in primary_purpose_areas}
-        print(f"[DEBUG] Found primary purpose: {primary_purpose}")
-        
-        # Count arms
-        print("[DEBUG] Counting arms...")
-        arms_num = arms_count(trial.get("Arms", ""))
-        
-        # Build row data
-        print("[DEBUG] Building row data...")
+        # Encodings and counts
+        study_enc = one_hot_study_type(trial.get("Study Type", ""))
+        phase_enc = one_hot_phases(trial.get("Phases", ""))
+        arm_num   = arms_count(trial.get("Arms", ""))
+
+        # Build output row
         row = {
-            "nct_id": trial.get("NCT ID", ""),
+            "nct_id": trial_id,
             "company_name": company_name,
-            "modality": modalities,
-            "indications": indications,
-            "disease_category": disease_category,
-            "disease_condition": disease_condition,
-            "phase": phase_encoding,
-            "sponsor_name": company_name,
-            "failed?": trial.get("Failed?", False),
-            "enrollment": trial.get("Enrollment", None),
+            "drug_name": drug_name,
+            **{key.split("--")[-1]: drug_info.get(key, "") for key in TARGET_ELEMENTS},
+            "study_type_interventional": study_enc["Interventional"],
+            "study_type_observational":  study_enc["Observational"],
+            "phase": phase_enc,
+            "arms_count": arm_num,
+            "number_of_sites": trial.get("Number of Sites"),
+            "enrollment": trial.get("Enrollment"),
             "overall_status": trial.get("Overall Status", ""),
-            "disease/condition": trial.get("Conditions", ""),
-            "accepts_healthy_volunteers": trial.get("Accepts Healthy Volunteers", False),
-            "primary_outcomes": trial.get("Primary Outcomes", ""),
-            "min_age": trial.get("Min Age", ""),
-            "max_age": trial.get("Max Age", ""),
-            "start_date": trial.get("Start Date", ""),
-            "Primary Completion Date": trial.get("Primary Completion Date", ""),
-            "Last Update Date": trial.get("Last Update Date", ""),
-            "study_type_interventional": study_type_encoding["Interventional"],
-            "study_type_observational": study_type_encoding["Observational"],
-            "arms_count": arms_num,
-            "number_of_sites": trial.get("Number of Sites", None),
-            "FDA_Regulated_Drug": one_hot_bool(trial.get("FDA Regulated Drug", False)),
-            "FDA_Regulated_Device": one_hot_bool(trial.get("FDA Regulated Device", False)),
+            "failed?": trial.get("Failed?", False),
+            "accepts_healthy_volunteers": one_hot_bool(trial.get("Accepts Healthy Volunteers", False)),
             "number_of_collaborators": count_collaborators(trial.get("Collaborators", "")),
-            **{f"primary_outcome_{k.replace(' ', '_').lower()}": v for k, v in primary_outcomes_encoding.items()},
-            **{f"secondary_outcome_{k.replace(' ', '_').lower()}": v for k, v in secondary_outcomes_encoding.items()},
-            **{f"primary_purpose_{k.replace(' ', '_').lower()}": v for k, v in primary_purpose_encoding.items()},
+            # ... include any additional trial fields you need ...
         }
         rows.append(row)
-        print(f"[DEBUG] Completed processing trial {i}")
-    
-    print(f"\n[DEBUG] Creating DataFrame for {company_name}")
+        print(f"[DEBUG] Finished trial {i}")
+
     df = pd.DataFrame(rows)
-    print(f"[DEBUG] DataFrame shape: {df.shape}")
+    print(f"[DEBUG] Built DataFrame: {df.shape} rows")
     return df
 
-# ---- Main script execution ----
 if __name__ == "__main__":
-    print("\n[DEBUG] Starting main script execution")
+    print("\n[DEBUG] Starting main script")
     
-    # Load the JSON file
-    print("[DEBUG] Loading companies data from JSON...")
-    with open("output/known_companies.json", "r") as f:
+    # Load companies JSON
+    with open("output/known_companies.json") as f:
         companies_data = json.load(f)
-    print(f"[DEBUG] Loaded data for {len(companies_data)} companies")
-        
-    # Initialize Azure OpenAI service
-    print("[DEBUG] Initializing Azure OpenAI service...")
-    from app.services.azure.azure_openai_service import AzureOpenaiService
-    azure_service = AzureOpenaiService()
-    
-    # Define lists
-    print("[DEBUG] Setting up classification lists...")
-    modality_path = "data/config/modalities.txt"
-    indication_path = "data/config/indications.txt"
-    with open(modality_path, "r") as f:
-        modality_list = [line.strip() for line in f.readlines()]
-    with open(indication_path, "r") as f:
-        indication_list = [line.strip() for line in f.readlines()]
-    print(f"[DEBUG] Loaded {len(modality_list)} modalities and {len(indication_list)} indications")
-    
-    outcome_areas = ["Clinical Outcomes", "Surrogate Outcomes", "Composite Outcomes",
-                    "Patient-Reported Outcomes", "Pharmacokinetic/Pharmacodynamic Outcomes",
-                    "Safety/Tolerability Outcomes"]
-    primary_purpose_areas = ["Treatment", "Prevention", "Diagnostic", "Supportive Care",
-                           "Screening", "Health Services Research", "Basic Science", "Other"]
-    
-    # Create or load the main DataFrame
-    output_file = "output/all_trials.csv"
+    print(f"[DEBUG] Found {len(companies_data)} companies")
+
+    # Prepare or load master CSV
+    out_csv = "output/all_trials.csv"
     try:
-        all_trials_df = pd.read_csv(output_file)
-        print(f"[DEBUG] Loaded existing trials from {output_file}")
+        all_df = pd.read_csv(out_csv)
+        print(f"[DEBUG] Loaded existing CSV ({all_df.shape[0]} rows)")
     except FileNotFoundError:
-        all_trials_df = pd.DataFrame()
-        print(f"[DEBUG] Creating new trials file at {output_file}")
-    
+        all_df = pd.DataFrame()
+        print("[DEBUG] No existing CSV, creating new one")
+
     # Process each company
-    print("\n[DEBUG] Starting company processing loop")
-    for company_name, company_info in companies_data.items():
-        print(f"\n[DEBUG] Processing company: {company_name}")
-        trials = company_info.get("trials", [])
-        print(f"[DEBUG] Found {len(trials)} trials for {company_name}")
-        
-        # Process trials for this company
-        company_trials = []
-        for i, trial in enumerate(trials, 1):
-            print(f"\n[DEBUG] Processing trial {i}/{len(trials)}")
-            
-            # Join Detailed Description and Brief Summary for modality and indication classification
-            description = ""
-            if trial.get("Detailed Description"):
-                description += trial["Detailed Description"]
-            if trial.get("Brief Summary"):
-                description += " " + trial["Brief Summary"]
-            print(f"[DEBUG] Combined description length: {len(description)} characters")
-                
-            print("[DEBUG] Classifying modality...")
-            modalities = get_modality_areas_from_description(description, azure_service, modality_list, company_name)
-            print(f"[DEBUG] Found modalities: {modalities}")
-            
-            print("[DEBUG] Classifying indications...")
-            indications = get_indication_areas_from_description(description, azure_service, indication_list, company_name)
-            print(f"[DEBUG] Found indications: {indications}")
-            
-            print("[DEBUG] Processing primary outcomes...")
-            primary_outcomes = get_outcome_areas_from_description(
-                trial.get("Primary Outcomes", ""), 
-                azure_service, 
-                outcome_areas,
-                company_name
-            )
-            primary_outcomes_encoding = {cat: 1 if cat in primary_outcomes else 0 for cat in outcome_areas}
-            print(f"[DEBUG] Found primary outcomes: {primary_outcomes}")
-            
-            print("[DEBUG] Processing secondary outcomes...")
-            secondary_outcomes = get_outcome_areas_from_description(
-                trial.get("Secondary Outcomes", ""), 
-                azure_service, 
-                outcome_areas,
-                company_name
-            )
-            secondary_outcomes_encoding = {cat: 1 if cat in secondary_outcomes else 0 for cat in outcome_areas}
-            print(f"[DEBUG] Found secondary outcomes: {secondary_outcomes}")
-            
-            print("[DEBUG] Encoding study type...")
-            study_type_encoding = one_hot_study_type(trial.get("Study Type", ""))
-            
-            print("[DEBUG] Encoding phases...")
-            phase_encoding = one_hot_phases(trial.get("Phases", ""))
-            
-            print("[DEBUG] Processing primary purpose...")
-            primary_purpose = get_primary_purpose_areas_from_description(
-                trial.get("Primary Purpose", ""), 
-                azure_service, 
-                primary_purpose_areas,
-                company_name
-            )
-            primary_purpose_encoding = {cat: 1 if cat in primary_purpose else 0 for cat in primary_purpose_areas}
-            print(f"[DEBUG] Found primary purpose: {primary_purpose}")
-            
-            print("[DEBUG] Counting arms...")
-            arms_num = arms_count(trial.get("Arms", ""))
-            
-            # Process disease conditions with validation
-            disease_category = ""
-            disease_condition = ""
-            disease_conditions_result = get_disease_condition_from_description(description, azure_service, company_name)
-            print(f"[DEBUG] Raw disease conditions result: {disease_conditions_result}")
-            
-            if disease_conditions_result:
-                if len(disease_conditions_result) >= 1:
-                    disease_category = disease_conditions_result[0]
-                    print(f"[DEBUG] Found disease category: {disease_category}")
-                if len(disease_conditions_result) >= 2:
-                    disease_condition = disease_conditions_result[1]
-                    print(f"[DEBUG] Found specific condition: {disease_condition}")
-            else:
-                print("[DEBUG] No disease conditions found")
-            
-            # Build row data
-            print("[DEBUG] Building row data...")
-            row = {
-                "nct_id": trial.get("NCT ID", ""),
-                "company_name": company_name,
-                "modality": modalities,
-                "indications": indications,
-                "disease_category": disease_category,
-                "disease_condition": disease_condition,
-                "phase": phase_encoding,
-                "sponsor_name": company_name,
-                "failed?": trial.get("Failed?", False),
-                "enrollment": trial.get("Enrollment", None),
-                "overall_status": trial.get("Overall Status", ""),
-                "disease/condition": trial.get("Conditions", ""),
-                "accepts_healthy_volunteers": trial.get("Accepts Healthy Volunteers", False),
-                "primary_outcomes": trial.get("Primary Outcomes", ""),
-                "min_age": trial.get("Min Age", ""),
-                "max_age": trial.get("Max Age", ""),
-                "start_date": trial.get("Start Date", ""),
-                "Primary Completion Date": trial.get("Primary Completion Date", ""),
-                "Last Update Date": trial.get("Last Update Date", ""),
-                "study_type_interventional": study_type_encoding["Interventional"],
-                "study_type_observational": study_type_encoding["Observational"],
-                "arms_count": arms_num,
-                "number_of_sites": trial.get("Number of Sites", None),
-                "FDA_Regulated_Drug": one_hot_bool(trial.get("FDA Regulated Drug", False)),
-                "FDA_Regulated_Device": one_hot_bool(trial.get("FDA Regulated Device", False)),
-                "number_of_collaborators": count_collaborators(trial.get("Collaborators", "")),
-                **{f"primary_outcome_{k.replace(' ', '_').lower()}": v for k, v in primary_outcomes_encoding.items()},
-                **{f"secondary_outcome_{k.replace(' ', '_').lower()}": v for k, v in secondary_outcomes_encoding.items()},
-                **{f"primary_purpose_{k.replace(' ', '_').lower()}": v for k, v in primary_purpose_encoding.items()},
-            }
-            company_trials.append(row)
-            print(f"[DEBUG] Completed processing trial {i}")
-        
-        # Convert company trials to DataFrame and append to main DataFrame
-        company_df = pd.DataFrame(company_trials)
-        all_trials_df = pd.concat([all_trials_df, company_df], ignore_index=True)
-        
-        # Save the updated DataFrame after each company
-        print(f"[DEBUG] Saving updated trials to {output_file}")
-        all_trials_df.to_csv(output_file, index=False)
-        print(f"[DEBUG] Saved {len(company_trials)} trials for {company_name}")
-    
-    print("\n[DEBUG] Script execution completed")
-    print(f"[DEBUG] Total trials processed: {len(all_trials_df)}")
-    print(f"[DEBUG] Final data saved to {output_file}")
+    for company, info in companies_data.items():
+        trials = info.get("trials", [])
+        comp_df = process_company(company, trials)
+        all_df = pd.concat([all_df, comp_df], ignore_index=True)
+        all_df.to_csv(out_csv, index=False)
+        print(f"[DEBUG] Saved {comp_df.shape[0]} trials for {company}")
+
+    print(f"[DEBUG] Completed. Total trials: {all_df.shape[0]}")
